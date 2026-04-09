@@ -17,6 +17,9 @@ const postToGetPatterns = [
   /^\/api\/card$/,
   /^\/api\/grades$/,
   /^\/api\/grades\/average$/,
+  /^\/api\/chemediaho\/export$/,
+  /^\/api\/chemediaho\/settings$/,
+  /^\/api\/chemediaho\/overall_average_detail$/,
   /^\/api\/lessons$/,
   /^\/api\/absences$/,
   /^\/api\/agenda$/,
@@ -223,6 +226,17 @@ const buildGradesAverages = (grades) => {
   };
 };
 
+const CHEMEDIAHO_ALLOWED_GRADES = [
+  4, 4.25, 4.5, 4.75, 5, 5.25, 5.5, 5.75, 6, 6.25, 6.5, 6.75, 7, 7.25, 7.5, 7.75,
+  8, 8.25, 8.5, 8.75, 9, 9.25, 9.5, 9.75, 10
+];
+const CHEMEDIAHO_GRADE_MIN = 1;
+const CHEMEDIAHO_GRADE_MAX = 10;
+const CHEMEDIAHO_DEFAULT_INCLUDE_BLUE_GRADES = false;
+const CHEMEDIAHO_MAX_NUM_GRADES = 10;
+const CHEMEDIAHO_MAX_SUGGESTIONS = 4;
+const CHEMEDIAHO_SUGGESTION_IMPACT_WEIGHT = 0.1;
+
 const findFirstNonEmpty = (...values) => {
   for (const value of values) {
     if (value === undefined || value === null) {
@@ -241,6 +255,606 @@ const findFirstNonEmpty = (...values) => {
 const sanitizeAttachmentFileName = (value, fallback = "document.pdf") => {
   const fileName = findFirstNonEmpty(value, fallback) || fallback;
   return fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+};
+
+const toFiniteNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const parseBoolean = (value, fallback = false) => {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "y", "on"].includes(normalized)) {
+      return true;
+    }
+    if (["0", "false", "no", "n", "off"].includes(normalized)) {
+      return false;
+    }
+  }
+
+  return fallback;
+};
+
+const getSessionIncludeBlueGrades = (session) => {
+  if (typeof session?.includeBlueGrades === "boolean") {
+    return session.includeBlueGrades;
+  }
+
+  return CHEMEDIAHO_DEFAULT_INCLUDE_BLUE_GRADES;
+};
+
+const isBlueGrade = (grade) => String(grade?.color || "").toLowerCase() === "blue";
+
+const toPeriodNumber = (grade) => {
+  const periodPos = toFiniteNumber(grade?.periodPos);
+  if (periodPos === null) {
+    return 1;
+  }
+
+  const adjusted = Math.floor(periodPos) - 1;
+  return adjusted >= 1 ? adjusted : 1;
+};
+
+const getEffectiveGradeValues = (gradesList) => {
+  const standalone = [];
+  const componentsByEvent = new Map();
+
+  for (const grade of gradesList || []) {
+    const decimalValue = toFiniteNumber(grade?.decimalValue);
+    if (decimalValue === null) {
+      continue;
+    }
+
+    const componentDesc =
+      typeof grade.componentDesc === "string" ? grade.componentDesc.trim() : "";
+
+    if (!componentDesc) {
+      standalone.push(decimalValue);
+      continue;
+    }
+
+    const groupKey =
+      findFirstNonEmpty(grade.evtId, grade.evtDate) || `component-${componentsByEvent.size + 1}`;
+
+    const existingValues = componentsByEvent.get(groupKey) || [];
+    existingValues.push(decimalValue);
+    componentsByEvent.set(groupKey, existingValues);
+  }
+
+  const effectiveGrades = [...standalone];
+  for (const values of componentsByEvent.values()) {
+    if (values.length === 0) {
+      continue;
+    }
+
+    effectiveGrades.push(values.reduce((sum, value) => sum + value, 0) / values.length);
+  }
+
+  return effectiveGrades;
+};
+
+const buildCheMediaHoGrades = (
+  grades,
+  { includeBlueGrades = CHEMEDIAHO_DEFAULT_INCLUDE_BLUE_GRADES } = {}
+) => {
+  const gradesAvr = {};
+
+  for (const grade of grades || []) {
+    const decimalValue = toFiniteNumber(grade?.decimalValue);
+    if (decimalValue === null || grade?.canceled === true) {
+      continue;
+    }
+
+    if (!includeBlueGrades && isBlueGrade(grade)) {
+      continue;
+    }
+
+    const period = String(toPeriodNumber(grade));
+    const subject = findFirstNonEmpty(grade.subjectDesc) || "Materia sconosciuta";
+
+    if (!gradesAvr[period]) {
+      gradesAvr[period] = {};
+    }
+
+    if (!gradesAvr[period][subject]) {
+      gradesAvr[period][subject] = {
+        count: 0,
+        avr: 0,
+        grades: []
+      };
+    }
+
+    gradesAvr[period][subject].count += 1;
+    gradesAvr[period][subject].grades.push({
+      decimalValue,
+      displayValue: findFirstNonEmpty(grade.displayValue) || String(decimalValue),
+      evtDate: findFirstNonEmpty(grade.evtDate) || "",
+      notesForFamily: findFirstNonEmpty(grade.notesForFamily) || "",
+      componentDesc: findFirstNonEmpty(grade.componentDesc) || "",
+      teacherName: findFirstNonEmpty(grade.teacherName) || "",
+      isBlue: isBlueGrade(grade)
+    });
+  }
+
+  for (const [period, subjects] of Object.entries(gradesAvr)) {
+    const periodGrades = [];
+
+    for (const [subject, subjectData] of Object.entries(subjects)) {
+      if (subject === "period_avr") {
+        continue;
+      }
+
+      const effectiveGrades = getEffectiveGradeValues(subjectData.grades);
+      subjectData.avr =
+        effectiveGrades.length > 0
+          ? Number(
+              (
+                effectiveGrades.reduce((sum, value) => sum + value, 0) / effectiveGrades.length
+              ).toFixed(2)
+            )
+          : 0;
+
+      periodGrades.push(...effectiveGrades);
+    }
+
+    gradesAvr[period].period_avr =
+      periodGrades.length > 0
+        ? Number((periodGrades.reduce((sum, value) => sum + value, 0) / periodGrades.length).toFixed(2))
+        : 0;
+  }
+
+  const allGrades = [];
+  for (const [period, subjects] of Object.entries(gradesAvr)) {
+    if (period === "all_avr") {
+      continue;
+    }
+
+    for (const [subject, subjectData] of Object.entries(subjects)) {
+      if (subject === "period_avr") {
+        continue;
+      }
+
+      allGrades.push(...getEffectiveGradeValues(subjectData.grades));
+    }
+  }
+
+  gradesAvr.all_avr =
+    allGrades.length > 0
+      ? Number((allGrades.reduce((sum, value) => sum + value, 0) / allGrades.length).toFixed(2))
+      : 0;
+
+  return gradesAvr;
+};
+
+const getPeriodKeys = (gradesAvr) =>
+  Object.keys(gradesAvr)
+    .filter((key) => key !== "all_avr")
+    .sort((a, b) => Number(a) - Number(b));
+
+const findSubjectKey = (periodData, subjectName) => {
+  const requestedSubject = findFirstNonEmpty(subjectName);
+  if (!requestedSubject || !periodData || typeof periodData !== "object") {
+    return null;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(periodData, requestedSubject)) {
+    return requestedSubject;
+  }
+
+  const normalizedRequested = requestedSubject.toLowerCase();
+  return (
+    Object.keys(periodData).find(
+      (subject) => subject !== "period_avr" && subject.toLowerCase() === normalizedRequested
+    ) || null
+  );
+};
+
+const getAllEffectiveGrades = (gradesAvr) => {
+  const allGrades = [];
+
+  for (const period of getPeriodKeys(gradesAvr)) {
+    const periodData = gradesAvr[period] || {};
+    for (const [subject, subjectData] of Object.entries(periodData)) {
+      if (subject === "period_avr") {
+        continue;
+      }
+
+      allGrades.push(...getEffectiveGradeValues(subjectData.grades));
+    }
+  }
+
+  return allGrades;
+};
+
+const collectSubjectGradesAcrossPeriods = (gradesAvr, subjectName) => {
+  const requestedSubject = findFirstNonEmpty(subjectName);
+  if (!requestedSubject) {
+    return { subject: null, grades: [] };
+  }
+
+  const normalizedRequested = requestedSubject.toLowerCase();
+  const collectedGrades = [];
+  let resolvedSubject = null;
+
+  for (const period of getPeriodKeys(gradesAvr)) {
+    const periodData = gradesAvr[period] || {};
+    for (const [subject, subjectData] of Object.entries(periodData)) {
+      if (subject === "period_avr") {
+        continue;
+      }
+
+      if (subject.toLowerCase() !== normalizedRequested) {
+        continue;
+      }
+
+      if (!resolvedSubject) {
+        resolvedSubject = subject;
+      }
+
+      collectedGrades.push(...getEffectiveGradeValues(subjectData.grades));
+    }
+  }
+
+  return {
+    subject: resolvedSubject,
+    grades: collectedGrades
+  };
+};
+
+const roundToAllowedGrade = (grade) => {
+  if (!Number.isFinite(grade)) {
+    return CHEMEDIAHO_ALLOWED_GRADES[0];
+  }
+
+  if (grade <= CHEMEDIAHO_ALLOWED_GRADES[0]) {
+    return CHEMEDIAHO_ALLOWED_GRADES[0];
+  }
+
+  const maxAllowed = CHEMEDIAHO_ALLOWED_GRADES[CHEMEDIAHO_ALLOWED_GRADES.length - 1];
+  if (grade >= maxAllowed) {
+    return maxAllowed;
+  }
+
+  return CHEMEDIAHO_ALLOWED_GRADES.reduce((closest, current) => {
+    return Math.abs(current - grade) < Math.abs(closest - grade) ? current : closest;
+  }, CHEMEDIAHO_ALLOWED_GRADES[0]);
+};
+
+const calculateOptimalGradesNeeded = (currentTotal, currentCount, targetAverage) => {
+  if (currentCount > 0 && currentTotal / currentCount >= targetAverage) {
+    return [0, []];
+  }
+
+  let minGradesNeeded = 1;
+  if (targetAverage < CHEMEDIAHO_GRADE_MAX) {
+    const numerator = targetAverage * currentCount - currentTotal;
+    const denominator = CHEMEDIAHO_GRADE_MAX - targetAverage;
+    if (denominator > 0) {
+      minGradesNeeded = Math.max(1, Math.floor(numerator / denominator) + 1);
+    }
+  }
+
+  minGradesNeeded = Math.min(minGradesNeeded, 5);
+
+  let requiredSum = targetAverage * (currentCount + minGradesNeeded) - currentTotal;
+  let requiredAverageGrade = requiredSum / minGradesNeeded;
+
+  while (requiredAverageGrade > CHEMEDIAHO_GRADE_MAX && minGradesNeeded < CHEMEDIAHO_MAX_NUM_GRADES) {
+    minGradesNeeded += 1;
+    requiredSum = targetAverage * (currentCount + minGradesNeeded) - currentTotal;
+    requiredAverageGrade = requiredSum / minGradesNeeded;
+  }
+
+  return [
+    minGradesNeeded,
+    Array.from({ length: minGradesNeeded }, () => Number(requiredAverageGrade.toFixed(1)))
+  ];
+};
+
+const calculatePeriodSubjectSuggestions = (gradesAvr, period, targetAverage, numGrades) => {
+  const periodData = gradesAvr[period];
+  if (!periodData || typeof periodData !== "object") {
+    return [];
+  }
+
+  const periodSubjects = Object.keys(periodData).filter((subject) => subject !== "period_avr");
+  const allPeriodGrades = periodSubjects.flatMap((subject) =>
+    getEffectiveGradeValues(periodData[subject].grades)
+  );
+
+  if (allPeriodGrades.length === 0) {
+    return [];
+  }
+
+  const currentPeriodTotal = allPeriodGrades.reduce((sum, value) => sum + value, 0);
+  const currentPeriodAverage = currentPeriodTotal / allPeriodGrades.length;
+  if (currentPeriodAverage >= targetAverage) {
+    return [];
+  }
+
+  const requiredSum = targetAverage * (allPeriodGrades.length + numGrades) - currentPeriodTotal;
+  const baselineRequiredGrade = requiredSum / numGrades;
+
+  const suggestions = [];
+  for (const subject of periodSubjects) {
+    const subjectGrades = getEffectiveGradeValues(periodData[subject].grades);
+    if (subjectGrades.length === 0) {
+      continue;
+    }
+
+    const currentAverage = subjectGrades.reduce((sum, value) => sum + value, 0) / subjectGrades.length;
+    const impactFactor = (1 / (subjectGrades.length + numGrades)) * 100;
+    const difficulty = baselineRequiredGrade - impactFactor * CHEMEDIAHO_SUGGESTION_IMPACT_WEIGHT;
+
+    suggestions.push({
+      subject,
+      current_average: Number(currentAverage.toFixed(2)),
+      required_grade: roundToAllowedGrade(baselineRequiredGrade),
+      raw_required_grade: Number(baselineRequiredGrade.toFixed(2)),
+      num_current_grades: subjectGrades.length,
+      difficulty: Number(difficulty.toFixed(2)),
+      impact: Number(impactFactor.toFixed(2)),
+      is_achievable: baselineRequiredGrade <= CHEMEDIAHO_GRADE_MAX
+    });
+  }
+
+  suggestions.sort((a, b) => {
+    if (a.is_achievable !== b.is_achievable) {
+      return a.is_achievable ? -1 : 1;
+    }
+
+    return a.difficulty - b.difficulty;
+  });
+
+  return suggestions.slice(0, CHEMEDIAHO_MAX_SUGGESTIONS);
+};
+
+const calculateOverallSubjectSuggestions = (gradesAvr, targetAverage, numGrades) => {
+  const allGrades = getAllEffectiveGrades(gradesAvr);
+  if (allGrades.length === 0) {
+    return [];
+  }
+
+  const currentTotal = allGrades.reduce((sum, value) => sum + value, 0);
+  const currentCount = allGrades.length;
+  const requiredSum = targetAverage * (currentCount + numGrades) - currentTotal;
+  const baselineRequiredGrade = requiredSum / numGrades;
+
+  const subjectsMap = new Map();
+  for (const period of getPeriodKeys(gradesAvr)) {
+    const periodData = gradesAvr[period] || {};
+
+    for (const [subject, subjectData] of Object.entries(periodData)) {
+      if (subject === "period_avr") {
+        continue;
+      }
+
+      const normalized = subject.toLowerCase();
+      const entry = subjectsMap.get(normalized) || {
+        subject,
+        grades: []
+      };
+
+      entry.grades.push(...getEffectiveGradeValues(subjectData.grades));
+      subjectsMap.set(normalized, entry);
+    }
+  }
+
+  const suggestions = [];
+  for (const entry of subjectsMap.values()) {
+    if (entry.grades.length === 0) {
+      continue;
+    }
+
+    const currentAverage = entry.grades.reduce((sum, value) => sum + value, 0) / entry.grades.length;
+    const impactFactor = (1 / (entry.grades.length + numGrades)) * 100;
+    const difficulty = baselineRequiredGrade - impactFactor * CHEMEDIAHO_SUGGESTION_IMPACT_WEIGHT;
+
+    suggestions.push({
+      subject: entry.subject,
+      current_average: Number(currentAverage.toFixed(2)),
+      required_grade: roundToAllowedGrade(baselineRequiredGrade),
+      raw_required_grade: Number(baselineRequiredGrade.toFixed(2)),
+      num_current_grades: entry.grades.length,
+      difficulty: Number(difficulty.toFixed(2)),
+      impact: Number(impactFactor.toFixed(2)),
+      is_achievable: baselineRequiredGrade <= CHEMEDIAHO_GRADE_MAX
+    });
+  }
+
+  suggestions.sort((a, b) => {
+    if (a.is_achievable !== b.is_achievable) {
+      return a.is_achievable ? -1 : 1;
+    }
+
+    return a.difficulty - b.difficulty;
+  });
+
+  return suggestions.slice(0, CHEMEDIAHO_MAX_SUGGESTIONS);
+};
+
+const getGoalMessage = (rawRequiredGrade, displayGrade, targetAverage, currentAverage, numGrades) => {
+  const gradeText = numGrades === 1 ? "un voto" : `${numGrades} voti`;
+
+  if (currentAverage >= targetAverage) {
+    return `Obiettivo gia raggiunto: media attuale ${currentAverage.toFixed(2)}.`;
+  }
+
+  if (rawRequiredGrade < CHEMEDIAHO_GRADE_MIN) {
+    return `Sei gia sopra l'obiettivo: anche con voti bassi raggiungi ${targetAverage}.`;
+  }
+
+  if (rawRequiredGrade > CHEMEDIAHO_GRADE_MAX) {
+    return `Obiettivo difficile: con ${gradeText} non arrivi a ${targetAverage}.`;
+  }
+
+  if (rawRequiredGrade >= 9) {
+    return `Serve molto impegno: punta ad almeno ${displayGrade} per ${gradeText}.`;
+  }
+
+  if (rawRequiredGrade >= 7) {
+    return `Obiettivo fattibile: con ${gradeText} da ${displayGrade} puoi arrivare a ${targetAverage}.`;
+  }
+
+  return `Obiettivo raggiungibile: con ${gradeText} da ${displayGrade} puoi arrivare a ${targetAverage}.`;
+};
+
+const getPredictMessage = (change, predictedAverage, numGrades) => {
+  const gradeText = numGrades === 1 ? "un voto" : `${numGrades} voti`;
+
+  if (change > 0.5) {
+    return `Ottimo: con ${gradeText} la media salirebbe a ${predictedAverage.toFixed(2)} (${change.toFixed(2)}).`;
+  }
+
+  if (change > 0) {
+    return `Bene: con ${gradeText} la media migliorerebbe a ${predictedAverage.toFixed(2)} (${change.toFixed(2)}).`;
+  }
+
+  if (change === 0) {
+    return `Con ${gradeText} la media resterebbe stabile a ${predictedAverage.toFixed(2)}.`;
+  }
+
+  if (change > -0.5) {
+    return `Attenzione: con ${gradeText} la media scenderebbe a ${predictedAverage.toFixed(2)} (${change.toFixed(2)}).`;
+  }
+
+  return `Attenzione: con ${gradeText} la media scenderebbe sensibilmente a ${predictedAverage.toFixed(2)} (${change.toFixed(2)}).`;
+};
+
+const getPeriodSuggestionMessage = (suggestions, targetAverage, numGrades, period) => {
+  if (!suggestions.length) {
+    return `Nessun suggerimento disponibile per il periodo ${period}.`;
+  }
+
+  const gradeText = numGrades === 1 ? "un voto" : `${numGrades} voti`;
+  const top = suggestions[0];
+
+  if (top.required_grade > CHEMEDIAHO_GRADE_MAX) {
+    return `Raggiungere ${targetAverage} nel periodo ${period} e molto difficile.`;
+  }
+
+  return `Concentrati su ${top.subject}: servono ${gradeText} da ${top.required_grade}.`;
+};
+
+const getOverallSuggestionMessage = (suggestions, targetAverage, numGrades) => {
+  if (!suggestions.length) {
+    return "Nessuna materia disponibile per il calcolo.";
+  }
+
+  const gradeText = numGrades === 1 ? "un voto" : `${numGrades} voti`;
+  const top = suggestions[0];
+
+  if (top.required_grade > CHEMEDIAHO_GRADE_MAX) {
+    return `Raggiungere la media generale ${targetAverage} e molto difficile.`;
+  }
+
+  return `Concentrati su ${top.subject}: servono ${gradeText} da ${top.required_grade}.`;
+};
+
+const getGoalOverallMessage = (
+  rawRequiredGrade,
+  displayGrade,
+  targetAverage,
+  currentAverage,
+  numGrades,
+  subject
+) => {
+  const gradeText = numGrades === 1 ? "un voto" : `${numGrades} voti`;
+
+  if (currentAverage >= targetAverage) {
+    return `Obiettivo gia raggiunto: media generale ${currentAverage.toFixed(2)}.`;
+  }
+
+  if (rawRequiredGrade > CHEMEDIAHO_GRADE_MAX) {
+    return `Obiettivo difficile: ${gradeText} in ${subject} non bastano per arrivare a ${targetAverage}.`;
+  }
+
+  if (rawRequiredGrade >= 9) {
+    return `Serve molto impegno: ${gradeText} da almeno ${displayGrade} in ${subject}.`;
+  }
+
+  return `Obiettivo fattibile: ${gradeText} da ${displayGrade} in ${subject}.`;
+};
+
+const getPredictOverallMessage = (change, predictedAverage, numGrades, subject) => {
+  const gradeText = numGrades === 1 ? "un voto" : `${numGrades} voti`;
+
+  if (change > 0.5) {
+    return `Ottimo: con ${gradeText} in ${subject} la media generale salirebbe a ${predictedAverage.toFixed(2)}.`;
+  }
+
+  if (change > 0) {
+    return `Bene: con ${gradeText} in ${subject} la media generale migliorerebbe a ${predictedAverage.toFixed(2)}.`;
+  }
+
+  if (change === 0) {
+    return `Con ${gradeText} in ${subject} la media generale resterebbe stabile a ${predictedAverage.toFixed(2)}.`;
+  }
+
+  if (change > -0.5) {
+    return `Attenzione: con ${gradeText} in ${subject} la media generale scenderebbe a ${predictedAverage.toFixed(2)}.`;
+  }
+
+  return `Attenzione: con ${gradeText} in ${subject} la media generale scenderebbe sensibilmente a ${predictedAverage.toFixed(2)}.`;
+};
+
+const csvEscape = (value) => {
+  const text = value === undefined || value === null ? "" : String(value);
+  if (!/[",\n\r]/.test(text)) {
+    return text;
+  }
+
+  return `"${text.replace(/"/g, '""')}"`;
+};
+
+const buildCsvFromGradesAvr = (gradesAvr) => {
+  const rows = [["Periodo", "Materia", "Voto", "Data", "Tipo", "Docente", "Note"]];
+
+  for (const period of getPeriodKeys(gradesAvr)) {
+    const periodData = gradesAvr[period] || {};
+    const subjects = Object.keys(periodData)
+      .filter((subject) => subject !== "period_avr")
+      .sort((a, b) => a.localeCompare(b));
+
+    for (const subject of subjects) {
+      const subjectData = periodData[subject];
+      for (const grade of subjectData.grades || []) {
+        rows.push([
+          `Periodo ${period}`,
+          subject,
+          grade.decimalValue,
+          grade.evtDate || "",
+          grade.componentDesc || "",
+          grade.teacherName || "",
+          grade.notesForFamily || ""
+        ]);
+      }
+    }
+  }
+
+  return rows.map((row) => row.map(csvEscape).join(",")).join("\n");
+};
+
+const nowTimestamp = (value = new Date()) => {
+  const twoDigits = (n) => String(n).padStart(2, "0");
+  return [
+    value.getFullYear(),
+    twoDigits(value.getMonth() + 1),
+    twoDigits(value.getDate()),
+    "_",
+    twoDigits(value.getHours()),
+    twoDigits(value.getMinutes()),
+    twoDigits(value.getSeconds())
+  ].join("");
 };
 
 const extractCredentials = (req) => {
@@ -310,6 +924,7 @@ const createSession = async ({ uid, password, ident = null }) => {
     lastName: loginData.lastName || null,
     release: loginData.release || null,
     expire: loginData.expire || null,
+    includeBlueGrades: CHEMEDIAHO_DEFAULT_INCLUDE_BLUE_GRADES,
     createdAt: new Date().toISOString()
   };
 
@@ -362,12 +977,30 @@ const requireSession = async (req, res, next) => {
 
 const getClient = (session) => new ClassevivaClient(session.token);
 
-app.get("/health", (req, res) => {
+const loadCheMediaHoGrades = async (session, options = {}) => {
+  const includeBlueGrades =
+    typeof options.includeBlueGrades === "boolean"
+      ? options.includeBlueGrades
+      : getSessionIncludeBlueGrades(session);
+
+  const client = getClient(session);
+  const data = await client.grades(session.studentId);
+  const grades = Array.isArray(data?.grades) ? data.grades : [];
+
+  return {
+    includeBlueGrades,
+    grades,
+    gradesAvr: buildCheMediaHoGrades(grades, { includeBlueGrades })
+  };
+};
+
+app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     service: "cvv-api",
     sessions: sessions.size,
-    baseUrl: config.classevivaBaseUrl
+    baseUrl: config.classevivaBaseUrl,
+    version: config.version
   });
 });
 
@@ -409,6 +1042,406 @@ app.post(
   asyncHandler(async (req, res) => {
     sessions.delete(req.localSessionId);
     res.json({ ok: true });
+  })
+);
+
+app.post(
+  "/api/chemediaho/logout",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    sessions.delete(req.localSessionId);
+    res.json({ success: true, ok: true });
+  })
+);
+
+app.get(
+  "/api/chemediaho/export",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    res.json({ authenticated: true });
+  })
+);
+
+app.get("/api/chemediaho/settings", (req, res) => {
+  res.json({
+    version: config.version
+  });
+});
+
+app.get(
+  "/api/chemediaho/overall_average_detail",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const { includeBlueGrades, gradesAvr } = await loadCheMediaHoGrades(req.localSession);
+
+    res.json({
+      include_blue_grades: includeBlueGrades,
+      ...gradesAvr
+    });
+  })
+);
+
+app.post(
+  "/api/chemediaho/set_blue_grade_preference",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const payload = req.body && typeof req.body === "object" ? req.body : {};
+    const includeBlueGrades = parseBoolean(
+      payload.include_blue_grades,
+      CHEMEDIAHO_DEFAULT_INCLUDE_BLUE_GRADES
+    );
+
+    req.localSession.includeBlueGrades = includeBlueGrades;
+    sessions.set(req.localSessionId, req.localSession);
+
+    const { gradesAvr } = await loadCheMediaHoGrades(req.localSession, { includeBlueGrades });
+
+    res.json({
+      success: true,
+      include_blue_grades: includeBlueGrades,
+      all_avr: gradesAvr.all_avr
+    });
+  })
+);
+
+app.post(
+  "/api/chemediaho/calculate_goal",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const payload = req.body && typeof req.body === "object" ? req.body : {};
+    const period = findFirstNonEmpty(payload.period);
+    const subject = findFirstNonEmpty(payload.subject);
+    const targetAverage = toFiniteNumber(payload.target_average);
+    const parsedNumGrades = toFiniteNumber(payload.num_grades);
+    const numGrades = parsedNumGrades === null ? 1 : Math.trunc(parsedNumGrades);
+
+    if (!period) {
+      return res.status(400).json({ error: "Periodo non trovato" });
+    }
+
+    if (targetAverage === null || targetAverage < CHEMEDIAHO_GRADE_MIN || targetAverage > CHEMEDIAHO_GRADE_MAX) {
+      return res.status(400).json({
+        error: "La media target deve essere tra 1 e 10"
+      });
+    }
+
+    if (!Number.isInteger(numGrades) || numGrades < 1 || numGrades > CHEMEDIAHO_MAX_NUM_GRADES) {
+      return res.status(400).json({
+        error: "Il numero di voti deve essere tra 1 e 10"
+      });
+    }
+
+    const { gradesAvr } = await loadCheMediaHoGrades(req.localSession);
+    const periodData = gradesAvr[period];
+
+    if (!periodData || typeof periodData !== "object") {
+      return res.status(400).json({ error: "Periodo non trovato" });
+    }
+
+    if (!subject) {
+      const suggestions = calculatePeriodSubjectSuggestions(gradesAvr, period, targetAverage, numGrades);
+      return res.json({
+        success: true,
+        period,
+        target_average: targetAverage,
+        suggestions,
+        num_grades: numGrades,
+        message: getPeriodSuggestionMessage(suggestions, targetAverage, numGrades, period)
+      });
+    }
+
+    const subjectKey = findSubjectKey(periodData, subject);
+    if (!subjectKey || subjectKey === "period_avr") {
+      return res.status(400).json({
+        error: "Materia non trovata nel periodo selezionato"
+      });
+    }
+
+    const subjectData = periodData[subjectKey];
+    const currentGrades = getEffectiveGradeValues(subjectData.grades);
+    if (currentGrades.length === 0) {
+      return res.status(400).json({
+        error: "Nessun voto disponibile per questa materia"
+      });
+    }
+
+    const currentSum = currentGrades.reduce((sum, value) => sum + value, 0);
+    const currentAverage =
+      toFiniteNumber(subjectData.avr) || (currentGrades.length > 0 ? currentSum / currentGrades.length : 0);
+
+    if (currentAverage >= targetAverage) {
+      return res.json({
+        success: true,
+        current_average: Number(currentAverage.toFixed(2)),
+        target_average: targetAverage,
+        required_grade: null,
+        required_grades: [],
+        current_grades_count: currentGrades.length,
+        achievable: true,
+        already_achieved: true,
+        subject: subjectKey,
+        message: `Obiettivo gia raggiunto: media attuale ${currentAverage.toFixed(2)}.`
+      });
+    }
+
+    const requiredSum = targetAverage * (currentGrades.length + numGrades) - currentSum;
+    const requiredAverageGrade = requiredSum / numGrades;
+    const displayGrade = roundToAllowedGrade(requiredAverageGrade);
+
+    return res.json({
+      success: true,
+      current_average: Number(currentAverage.toFixed(2)),
+      target_average: targetAverage,
+      required_grade: displayGrade,
+      required_grades: Array.from({ length: numGrades }, () => displayGrade),
+      current_grades_count: currentGrades.length,
+      achievable:
+        requiredAverageGrade >= CHEMEDIAHO_GRADE_MIN && requiredAverageGrade <= CHEMEDIAHO_GRADE_MAX,
+      already_achieved: false,
+      subject: subjectKey,
+      message: getGoalMessage(
+        requiredAverageGrade,
+        displayGrade,
+        targetAverage,
+        currentAverage,
+        numGrades
+      )
+    });
+  })
+);
+
+app.post(
+  "/api/chemediaho/predict_average",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const payload = req.body && typeof req.body === "object" ? req.body : {};
+    const period = findFirstNonEmpty(payload.period);
+    const subject = findFirstNonEmpty(payload.subject);
+    const predictedGrades = Array.isArray(payload.predicted_grades) ? payload.predicted_grades : [];
+
+    if (!period || !subject) {
+      return res.status(400).json({ error: "Materia o periodo non trovato" });
+    }
+
+    if (!predictedGrades.length) {
+      return res.status(400).json({ error: "Inserisci almeno un voto previsto" });
+    }
+
+    const normalizedPredictedGrades = predictedGrades.map((grade) => toFiniteNumber(grade));
+    if (
+      normalizedPredictedGrades.some(
+        (grade) => grade === null || grade < CHEMEDIAHO_GRADE_MIN || grade > CHEMEDIAHO_GRADE_MAX
+      )
+    ) {
+      return res.status(400).json({ error: "Tutti i voti devono essere tra 1 e 10" });
+    }
+
+    const { gradesAvr } = await loadCheMediaHoGrades(req.localSession);
+    const periodData = gradesAvr[period];
+    const subjectKey = findSubjectKey(periodData, subject);
+
+    if (!periodData || !subjectKey || subjectKey === "period_avr") {
+      return res.status(400).json({ error: "Materia o periodo non trovato" });
+    }
+
+    const currentGrades = getEffectiveGradeValues(periodData[subjectKey].grades);
+    if (!currentGrades.length) {
+      return res.status(400).json({ error: "Nessun voto disponibile per questa materia" });
+    }
+
+    const currentAverage =
+      toFiniteNumber(periodData[subjectKey].avr) ||
+      currentGrades.reduce((sum, value) => sum + value, 0) / currentGrades.length;
+
+    const allGrades = [...currentGrades, ...normalizedPredictedGrades];
+    const predictedAverage = allGrades.reduce((sum, value) => sum + value, 0) / allGrades.length;
+    const change = predictedAverage - currentAverage;
+
+    return res.json({
+      success: true,
+      current_average: Number(currentAverage.toFixed(2)),
+      predicted_average: Number(predictedAverage.toFixed(2)),
+      change: Number(change.toFixed(2)),
+      num_predicted_grades: normalizedPredictedGrades.length,
+      message: getPredictMessage(change, predictedAverage, normalizedPredictedGrades.length)
+    });
+  })
+);
+
+app.post(
+  "/api/chemediaho/calculate_goal_overall",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const payload = req.body && typeof req.body === "object" ? req.body : {};
+    const subject = findFirstNonEmpty(payload.subject);
+    const targetAverage = toFiniteNumber(payload.target_average);
+    const parsedNumGrades = toFiniteNumber(payload.num_grades);
+
+    if (targetAverage === null || targetAverage < CHEMEDIAHO_GRADE_MIN || targetAverage > CHEMEDIAHO_GRADE_MAX) {
+      return res.status(400).json({ error: "La media target deve essere tra 1 e 10" });
+    }
+
+    const { gradesAvr } = await loadCheMediaHoGrades(req.localSession);
+    const currentOverallAverage = toFiniteNumber(gradesAvr.all_avr) || 0;
+
+    if (currentOverallAverage >= targetAverage) {
+      return res.json({
+        success: true,
+        current_overall_average: Number(currentOverallAverage.toFixed(2)),
+        target_average: targetAverage,
+        suggestions: [],
+        num_grades: 0,
+        auto_calculated: true,
+        already_achieved: true,
+        message: `Obiettivo gia raggiunto: media generale ${currentOverallAverage.toFixed(2)}.`
+      });
+    }
+
+    const allGrades = getAllEffectiveGrades(gradesAvr);
+    if (!allGrades.length) {
+      return res.status(400).json({ error: "Nessun voto disponibile" });
+    }
+
+    const currentTotal = allGrades.reduce((sum, value) => sum + value, 0);
+    const currentCount = allGrades.length;
+
+    let numGrades;
+    let autoCalculated;
+
+    if (parsedNumGrades === null) {
+      [numGrades] = calculateOptimalGradesNeeded(currentTotal, currentCount, targetAverage);
+      autoCalculated = true;
+    } else {
+      numGrades = Math.trunc(parsedNumGrades);
+      autoCalculated = false;
+    }
+
+    if (!Number.isInteger(numGrades) || numGrades < 1 || numGrades > CHEMEDIAHO_MAX_NUM_GRADES) {
+      return res.status(400).json({
+        error: "Il numero di voti deve essere tra 1 e 10"
+      });
+    }
+
+    const requiredSum = targetAverage * (currentCount + numGrades) - currentTotal;
+    const requiredAverageGrade = requiredSum / numGrades;
+
+    if (!subject) {
+      const suggestions = calculateOverallSubjectSuggestions(gradesAvr, targetAverage, numGrades);
+
+      return res.json({
+        success: true,
+        current_overall_average: Number(currentOverallAverage.toFixed(2)),
+        target_average: targetAverage,
+        suggestions,
+        num_grades: numGrades,
+        auto_calculated: autoCalculated,
+        message: getOverallSuggestionMessage(suggestions, targetAverage, numGrades)
+      });
+    }
+
+    const subjectData = collectSubjectGradesAcrossPeriods(gradesAvr, subject);
+    if (!subjectData.subject || !subjectData.grades.length) {
+      return res.status(400).json({ error: "Materia non trovata" });
+    }
+
+    const displayGrade = roundToAllowedGrade(requiredAverageGrade);
+
+    return res.json({
+      success: true,
+      current_overall_average: Number(currentOverallAverage.toFixed(2)),
+      target_average: targetAverage,
+      required_grade: displayGrade,
+      required_grades: Array.from({ length: numGrades }, () => displayGrade),
+      current_grades_count: currentCount,
+      achievable:
+        requiredAverageGrade >= CHEMEDIAHO_GRADE_MIN && requiredAverageGrade <= CHEMEDIAHO_GRADE_MAX,
+      subject: subjectData.subject,
+      message: getGoalOverallMessage(
+        requiredAverageGrade,
+        displayGrade,
+        targetAverage,
+        currentOverallAverage,
+        numGrades,
+        subjectData.subject
+      )
+    });
+  })
+);
+
+app.post(
+  "/api/chemediaho/predict_average_overall",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const payload = req.body && typeof req.body === "object" ? req.body : {};
+    const period = findFirstNonEmpty(payload.period);
+    const subject = findFirstNonEmpty(payload.subject);
+    const predictedGrades = Array.isArray(payload.predicted_grades) ? payload.predicted_grades : [];
+
+    if (!period || !subject) {
+      return res.status(400).json({ error: "Materia o periodo non trovato" });
+    }
+
+    if (!predictedGrades.length) {
+      return res.status(400).json({ error: "Inserisci almeno un voto previsto" });
+    }
+
+    const normalizedPredictedGrades = predictedGrades.map((grade) => toFiniteNumber(grade));
+    if (
+      normalizedPredictedGrades.some(
+        (grade) => grade === null || grade < CHEMEDIAHO_GRADE_MIN || grade > CHEMEDIAHO_GRADE_MAX
+      )
+    ) {
+      return res.status(400).json({ error: "Tutti i voti devono essere tra 1 e 10" });
+    }
+
+    const { gradesAvr } = await loadCheMediaHoGrades(req.localSession);
+    const periodData = gradesAvr[period];
+    const subjectKey = findSubjectKey(periodData, subject);
+
+    if (!periodData || !subjectKey || subjectKey === "period_avr") {
+      return res.status(400).json({ error: "Materia o periodo non trovato" });
+    }
+
+    const allGrades = getAllEffectiveGrades(gradesAvr);
+    if (!allGrades.length) {
+      return res.status(400).json({ error: "Nessun voto disponibile" });
+    }
+
+    const currentOverallAverage = toFiniteNumber(gradesAvr.all_avr) || 0;
+    const predictedOverallAverage =
+      [...allGrades, ...normalizedPredictedGrades].reduce((sum, value) => sum + value, 0) /
+      (allGrades.length + normalizedPredictedGrades.length);
+    const change = predictedOverallAverage - currentOverallAverage;
+
+    return res.json({
+      success: true,
+      current_overall_average: Number(currentOverallAverage.toFixed(2)),
+      predicted_overall_average: Number(predictedOverallAverage.toFixed(2)),
+      change: Number(change.toFixed(2)),
+      num_predicted_grades: normalizedPredictedGrades.length,
+      subject: subjectKey,
+      period,
+      message: getPredictOverallMessage(
+        change,
+        predictedOverallAverage,
+        normalizedPredictedGrades.length,
+        subjectKey
+      )
+    });
+  })
+);
+
+app.post(
+  "/api/chemediaho/export/csv",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const { gradesAvr } = await loadCheMediaHoGrades(req.localSession);
+    const csv = buildCsvFromGradesAvr(gradesAvr);
+    const fileName = `voti_${nowTimestamp()}.csv`;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename=\"${fileName}\"`);
+    res.send(csv);
   })
 );
 

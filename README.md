@@ -86,6 +86,20 @@ l'api effettuerà il login per te, creerà la sessione e restituirà i dati insi
 - `post /api/raw` → chiama un endpoint a scelta (es. `{"method": "get", "path": "/v1/..."}`)
 - `get /health` → verifica se il server è online
 
+### 🧮 compatibilità chemediaho
+- `post /api/chemediaho/logout`
+- `get /api/chemediaho/export`
+- `get /api/chemediaho/settings`
+- `get /api/chemediaho/overall_average_detail`
+- `post /api/chemediaho/set_blue_grade_preference`
+- `post /api/chemediaho/calculate_goal`
+- `post /api/chemediaho/predict_average`
+- `post /api/chemediaho/calculate_goal_overall`
+- `post /api/chemediaho/predict_average_overall`
+- `post /api/chemediaho/export/csv`
+
+questi endpoint usano la stessa sessione locale (`x-session-id`) e lo stesso auto-login con `username/password`.
+
 ---
 
 ## 💻 esempi veloci con curl
