@@ -76,9 +76,10 @@ l'api effettuerà il login per te, creerà la sessione e restituirà i dati insi
 
 ### 📂 bacheca e documenti
 - `get /api/noticeboard` → circolari e comunicazioni
+- `get /api/noticeboard/download/:pubId/:attachNum` → scarica allegato circolare
 - `get /api/didactics` → materiali caricati dai docenti
 - `get /api/documents` → elenco documenti personali
-- `get /api/documents/download/:hash` → scarica direttamente il file pdf
+- `get /api/documents/download/:hash` → scarica documento personale (non circolare)
 
 ### 🛠️ utility
 - `get /api/overview` → riassunto generale del profilo
@@ -96,12 +97,15 @@ curl -x post http://localhost:3000/api/grades \
   -d '{"username":"s1234567i","password":"la_tua_password"}'
 ```
 
-### 2. scaricare un compito/documento
+### 2. scaricare una circolare dalla bacheca
 ```bash
-curl -l "http://localhost:3000/api/documents/download/id_documento" \
+curl -L "http://localhost:3000/api/noticeboard/download/PUB_ID/ATTACH_NUM" \
   -h "x-session-id: il_tuo_session_id" \
-  --output file_scuola.pdf
+   --output circolare.pdf
 ```
+
+> `PUB_ID` e `ATTACH_NUM` li trovi in `GET /api/noticeboard`.
+> Ogni allegato include anche `attachments[].downloadUrl` pronto da usare.
 
 ---
 

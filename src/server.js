@@ -24,6 +24,7 @@ const postToGetPatterns = [
   /^\/api\/subjects$/,
   /^\/api\/periods$/,
   /^\/api\/noticeboard$/,
+  /^\/api\/noticeboard\/download\/[^/]+(?:\/[^/]+)?$/,
   /^\/api\/calendar$/,
   /^\/api\/didactics$/,
   /^\/api\/documents$/,
@@ -605,10 +606,84 @@ app.get(
   asyncHandler(async (req, res) => {
     const client = getClient(req.localSession);
     const data = await client.noticeboard(req.localSession.studentId);
-    res.json({
-      count: (data.items || []).length,
-      items: data.items || []
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const items = (data.items || []).map((item) => {
+      const eventCode = findFirstNonEmpty(item.evtCode) || "CF";
+      const attachments = (item.attachments || []).map((attachment) => {
+        const attachNum = attachment.attachNum;
+        const downloadUrl =
+          `${baseUrl}/api/noticeboard/download/${encodeURIComponent(item.pubId)}` +
+          `/${encodeURIComponent(attachNum)}?eventCode=${encodeURIComponent(eventCode)}`;
+
+        return {
+          ...attachment,
+          downloadUrl
+        };
+      });
+
+      return {
+        ...item,
+        attachments,
+        defaultDownloadUrl:
+          attachments.length > 0
+            ? attachments[0].downloadUrl
+            : `${baseUrl}/api/noticeboard/download/${encodeURIComponent(item.pubId)}?eventCode=${encodeURIComponent(eventCode)}`
+      };
     });
+
+    res.json({
+      count: items.length,
+      items
+    });
+  })
+);
+
+app.get(
+  "/api/noticeboard/download/:pubId/:attachNum?",
+  requireSession,
+  asyncHandler(async (req, res) => {
+    const client = getClient(req.localSession);
+    const studentId = req.localSession.studentId;
+
+    const pubId = String(req.params.pubId);
+    const requestedEventCode = findFirstNonEmpty(req.query.eventCode, req.body?.eventCode);
+    const requestedAttachNum = findFirstNonEmpty(
+      req.params.attachNum,
+      req.query.attachNum,
+      req.body?.attachNum
+    );
+
+    const noticeboardData = await client.noticeboard(studentId);
+    const item = (noticeboardData.items || []).find((current) => String(current.pubId) === pubId);
+
+    if (!item && !requestedEventCode) {
+      return res.status(404).json({
+        error: "Noticeboard item not found",
+        hint: "Provide a valid pubId or pass eventCode explicitly"
+      });
+    }
+
+    const eventCode = requestedEventCode || findFirstNonEmpty(item?.evtCode) || "CF";
+    const attachments = item?.attachments || [];
+    const attachNum =
+      requestedAttachNum ||
+      (attachments.length > 0 ? String(attachments[0].attachNum) : "101");
+
+    const matchedAttachment = attachments.find(
+      (attachment) => String(attachment.attachNum) === String(attachNum)
+    );
+    const fallbackFileName = `circolare_${pubId}_${attachNum}.pdf`;
+    const fileName = sanitizeAttachmentFileName(
+      findFirstNonEmpty(req.query.filename, req.body?.filename),
+      matchedAttachment?.fileName || fallbackFileName
+    );
+
+    const attachment = await client.noticeboardAttachment(studentId, eventCode, pubId, attachNum);
+
+    res.setHeader("Content-Type", attachment.contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.send(Buffer.from(attachment.data));
   })
 );
 
