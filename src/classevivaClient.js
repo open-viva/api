@@ -111,6 +111,22 @@ export class ClassevivaClient {
     return this.get(`/v1/students/${studentId}/noticeboard`);
   }
 
+  async noticeboardAttachment(studentId, eventCode, pubId, attachNum = 101) {
+    const response = await this.http.get(
+      `/v1/students/${studentId}/noticeboard/attach/${eventCode}/${pubId}/${attachNum}`,
+      {
+        headers: this.headers(),
+        responseType: "arraybuffer"
+      }
+    );
+
+    return {
+      data: response.data,
+      contentType: response.headers["content-type"] || "application/octet-stream",
+      contentDisposition: response.headers["content-disposition"] || null
+    };
+  }
+
   async didactics(studentId) {
     return this.get(`/v1/students/${studentId}/didactics`);
   }
